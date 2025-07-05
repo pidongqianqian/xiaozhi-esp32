@@ -12,6 +12,8 @@
 #include "mcp_server.h"
 #include "audio_debugger.h"
 
+#include <mbedtls/base64.h>
+
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "afe_audio_processor.h"
 #else
@@ -595,11 +597,27 @@ void Application::Start() {
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
+        } else if (strcmp(type->valuestring, "push_audio") == 0) {
+            // 处理推送音频（当没有独立推送通道时）
+            auto audio_data = cJSON_GetObjectItem(root, "audio_data");
+            if (cJSON_IsString(audio_data)) {
+                HandlePushAudio(audio_data->valuestring);
+            }
+        } else if (strcmp(type->valuestring, "push_command") == 0) {
+            // 处理推送命令（当没有独立推送通道时）
+            auto command = cJSON_GetObjectItem(root, "command");
+            auto params = cJSON_GetObjectItem(root, "params");
+            if (cJSON_IsString(command)) {
+                HandlePushCommand(command->valuestring, params);
+            }
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
     });
     bool protocol_started = protocol_->Start();
+
+    // 新增：初始化推送通道
+    StartPushChannel();
 
     audio_debugger_ = std::make_unique<AudioDebugger>();
     audio_processor_->Initialize(codec);
@@ -800,7 +818,7 @@ void Application::AudioLoop() {
 }
 
 void Application::OnAudioOutput() {
-    if (busy_decoding_audio_) {
+    if (busy_decoding_audio_ || busy_decoding_push_audio_) {
         return;
     }
 
@@ -808,6 +826,39 @@ void Application::OnAudioOutput() {
     auto codec = Board::GetInstance().GetAudioCodec();
     const int max_silence_seconds = 10;
 
+    // 优先处理推送音频队列
+    {
+        std::unique_lock<std::mutex> push_lock(push_mutex_);
+        if (!push_audio_queue_.empty()) {
+            auto packet = std::move(push_audio_queue_.front());
+            push_audio_queue_.pop_front();
+            push_lock.unlock();
+            
+            // 处理推送音频
+            busy_decoding_push_audio_ = true;
+            if (!background_task_->Schedule([this, codec, packet = std::move(packet)]() mutable {
+                busy_decoding_push_audio_ = false;
+                
+                std::vector<int16_t> pcm;
+                if (push_audio_decoder_ && push_audio_decoder_->Decode(std::move(packet.payload), pcm)) {
+                    // 重采样如果需要
+                    if (push_audio_decoder_->sample_rate() != codec->output_sample_rate()) {
+                        int target_size = output_resampler_.GetOutputSamples(pcm.size());
+                        std::vector<int16_t> resampled(target_size);
+                        output_resampler_.Process(pcm.data(), pcm.size(), resampled.data());
+                        pcm = std::move(resampled);
+                    }
+                    codec->OutputData(pcm);
+                    last_output_time_ = std::chrono::steady_clock::now();
+                }
+            })) {
+                busy_decoding_push_audio_ = false;
+            }
+            return;
+        }
+    }
+
+    // 处理正常的音频队列
     std::unique_lock<std::mutex> lock(mutex_);
     if (audio_decode_queue_.empty()) {
         // Disable the output if there is no audio data for a long time
@@ -1143,4 +1194,170 @@ void Application::SetAecMode(AecMode mode) {
             protocol_->CloseAudioChannel();
         }
     });
+}
+
+// 新增：推送通道相关实现
+void Application::StartPushChannel() {
+    ESP_LOGI(TAG, "Starting push channel");
+    
+    // 创建推送通道协议实例
+    Settings settings("push", false);
+    std::string push_url = settings.GetString("url");
+    
+    if (push_url.empty()) {
+        // 如果没有专门的推送地址，使用主协议的地址
+        ESP_LOGI(TAG, "No separate push URL configured, using main protocol for push channel");
+        push_channel_active_ = true;
+        return;
+    }
+    
+    // 创建独立的推送协议实例
+    if (push_url.find("ws://") == 0 || push_url.find("wss://") == 0) {
+        push_protocol_ = std::make_unique<WebsocketProtocol>();
+    } else {
+        push_protocol_ = std::make_unique<MqttProtocol>();
+    }
+    
+    // 初始化推送音频解码器
+    auto codec = Board::GetInstance().GetAudioCodec();
+    push_audio_decoder_ = std::make_unique<OpusDecoderWrapper>(codec->output_sample_rate(), 1, OPUS_FRAME_DURATION_MS);
+    
+    // 设置推送通道的回调
+    push_protocol_->OnIncomingJson([this](const cJSON* root) {
+        auto type = cJSON_GetObjectItem(root, "type");
+        if (!cJSON_IsString(type)) {
+            return;
+        }
+        
+        if (strcmp(type->valuestring, "push_audio") == 0) {
+            // 处理推送音频命令
+            auto audio_data = cJSON_GetObjectItem(root, "audio_data");
+            if (cJSON_IsString(audio_data)) {
+                HandlePushAudio(audio_data->valuestring);
+            }
+        } else if (strcmp(type->valuestring, "push_command") == 0) {
+            // 处理推送命令
+            auto command = cJSON_GetObjectItem(root, "command");
+            auto params = cJSON_GetObjectItem(root, "params");
+            if (cJSON_IsString(command)) {
+                HandlePushCommand(command->valuestring, params);
+            }
+        }
+    });
+    
+    push_protocol_->OnIncomingAudio([this](AudioStreamPacket&& packet) {
+        std::lock_guard<std::mutex> lock(push_mutex_);
+        if (push_audio_queue_.size() < MAX_AUDIO_PACKETS_IN_QUEUE) {
+            push_audio_queue_.emplace_back(std::move(packet));
+            push_audio_cv_.notify_all();
+        }
+    });
+    
+    push_protocol_->OnNetworkError([this](const std::string& message) {
+        ESP_LOGW(TAG, "Push channel network error: %s", message.c_str());
+        push_channel_active_ = false;
+    });
+    
+    // 启动推送通道
+    if (push_protocol_->Start()) {
+        push_channel_active_ = true;
+        ESP_LOGI(TAG, "Push channel started successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to start push channel");
+    }
+}
+
+void Application::StopPushChannel() {
+    ESP_LOGI(TAG, "Stopping push channel");
+    
+    push_channel_active_ = false;
+    
+    if (push_protocol_) {
+        push_protocol_.reset();
+    }
+    
+    if (push_audio_decoder_) {
+        push_audio_decoder_.reset();
+    }
+    
+    std::lock_guard<std::mutex> lock(push_mutex_);
+    push_audio_queue_.clear();
+    push_audio_cv_.notify_all();
+}
+
+void Application::HandlePushAudio(const std::string& audio_data) {
+    ESP_LOGI(TAG, "Received push audio data");
+    
+    // 解码Base64编码的音频数据
+    size_t required_size = 0;
+    int ret = mbedtls_base64_decode(nullptr, 0, &required_size, 
+                                   (const unsigned char*)audio_data.c_str(), audio_data.length());
+    if (ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) {
+        ESP_LOGE(TAG, "Failed to calculate base64 decode size: %d", ret);
+        return;
+    }
+    
+    AudioStreamPacket packet;
+    packet.sample_rate = 16000;  // 或从配置中获取
+    packet.frame_duration = OPUS_FRAME_DURATION_MS;
+    packet.payload.resize(required_size);
+    
+    size_t output_len = 0;
+    ret = mbedtls_base64_decode(packet.payload.data(), packet.payload.size(), &output_len,
+                               (const unsigned char*)audio_data.c_str(), audio_data.length());
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to decode base64 audio data: %d", ret);
+        return;
+    }
+    
+    packet.payload.resize(output_len);
+    
+    // 立即播放推送的音频，不论当前设备状态
+    Schedule([this, packet = std::move(packet)]() mutable {
+        ResetDecoder();
+        std::lock_guard<std::mutex> lock(push_mutex_);
+        push_audio_queue_.emplace_back(std::move(packet));
+        push_audio_cv_.notify_all();
+    });
+}
+
+void Application::HandlePushCommand(const std::string& command_type, const cJSON* params) {
+    ESP_LOGI(TAG, "Received push command: %s", command_type.c_str());
+    
+    if (command_type == "play_sound") {
+        // 播放预定义的音效
+        auto sound_name = cJSON_GetObjectItem(params, "sound");
+        if (cJSON_IsString(sound_name)) {
+            Schedule([this, sound = std::string(sound_name->valuestring)]() {
+                ResetDecoder();
+                // 根据sound名称播放对应的音效
+                if (sound == "success") {
+                    PlaySound(Lang::Sounds::P3_SUCCESS);
+                } else if (sound == "error") {
+                    PlaySound(Lang::Sounds::P3_EXCLAMATION);
+                } else if (sound == "notification") {
+                    PlaySound(Lang::Sounds::P3_VIBRATION);
+                }
+            });
+        }
+    } else if (command_type == "show_message") {
+        // 显示消息
+        auto message = cJSON_GetObjectItem(params, "message");
+        auto emotion = cJSON_GetObjectItem(params, "emotion");
+        if (cJSON_IsString(message)) {
+            const char* emotion_str = cJSON_IsString(emotion) ? emotion->valuestring : "neutral";
+            Schedule([this, msg = std::string(message->valuestring), emo = std::string(emotion_str)]() {
+                auto display = Board::GetInstance().GetDisplay();
+                display->SetChatMessage("system", msg.c_str());
+                display->SetEmotion(emo.c_str());
+            });
+        }
+    } else if (command_type == "wake_device") {
+        // 主动唤醒设备进入交互模式
+        Schedule([this]() {
+            if (device_state_ == kDeviceStateIdle) {
+                ToggleChatState();
+            }
+        });
+    }
 }

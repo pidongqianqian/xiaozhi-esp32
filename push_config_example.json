@@ -1,0 +1,34 @@
+{
+  "description": "推送通道配置示例",
+  "push": {
+    "url": "wss://push.example.com/device",
+    "token": "your_push_token",
+    "keepalive": 30,
+    "reconnect_interval": 5,
+    "max_retries": 10
+  },
+  "audio_settings": {
+    "sample_rate": 16000,
+    "frame_duration": 60,
+    "priority": "high"
+  },
+  "features": {
+    "push_audio": true,
+    "push_commands": true,
+    "auto_reconnect": true
+  },
+  "commands": {
+    "play_sound": {
+      "enabled": true,
+      "sounds": ["notification", "success", "error", "warning"]
+    },
+    "show_message": {
+      "enabled": true,
+      "max_length": 200
+    },
+    "wake_device": {
+      "enabled": true,
+      "permission_required": false
+    }
+  }
+}

@@ -83,6 +83,13 @@ public:
     bool ReadAudio(std::vector<int16_t>& data, int sample_rate, int samples);
     AecMode GetAecMode() const { return aec_mode_; }
     BackgroundTask* GetBackgroundTask() const { return background_task_; }
+    
+    // 新增：推送通道相关方法
+    void StartPushChannel();
+    void StopPushChannel();
+    bool IsPushChannelActive() const { return push_channel_active_; }
+    void HandlePushAudio(const std::string& audio_data);
+    void HandlePushCommand(const std::string& command_type, const cJSON* params);
 
 private:
     Application();
@@ -126,6 +133,17 @@ private:
     OpusResampler input_resampler_;
     OpusResampler reference_resampler_;
     OpusResampler output_resampler_;
+    
+    // 新增：推送通道相关成员
+    std::unique_ptr<Protocol> push_protocol_;
+    bool push_channel_active_ = false;
+    std::mutex push_mutex_;
+    
+    // 新增：用于推送音频的独立解码器
+    std::unique_ptr<OpusDecoderWrapper> push_audio_decoder_;
+    std::list<AudioStreamPacket> push_audio_queue_;
+    std::condition_variable push_audio_cv_;
+    bool busy_decoding_push_audio_ = false;
 
     void MainEventLoop();
     void OnAudioInput();
